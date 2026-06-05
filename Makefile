@@ -9,7 +9,7 @@ build:
 	@echo "built $(BIN)"
 
 run: build
-	./$(BIN) host --addr :8087 --fps 12 --quality 70
+	./$(BIN) host --addr :8087 --fps 40 --quality 70
 
 clean:
 	rm -rf bin

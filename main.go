@@ -35,9 +35,9 @@ func main() {
 
 	fs := flag.NewFlagSet("host", flag.ExitOnError)
 	addr := fs.String("addr", ":8080", "address to serve the viewer on")
-	fpsFlag := fs.Int("fps", 12, "capture frames per second")
+	fpsFlag := fs.Int("fps", 40, "capture frames per second")
 	quality := fs.Int("quality", 70, "JPEG quality 1-100")
-	width := fs.Int("width", 0, "scale to this width keeping aspect (0 = native)")
+	width := fs.Int("width", 0, "scale to this width keeping aspect (0 = native); e.g. 1280 = 720p")
 	script := fs.String("capture", "", "path to capture.py (default: next to the binary, then ./capture.py)")
 	fs.Parse(os.Args[2:])
 

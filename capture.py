@@ -150,7 +150,10 @@ def open_remote():
 def start_pipeline(fd, node_id):
     scale = ""
     if WIDTH > 0:
-        scale = f"videoscale ! video/x-raw,width={WIDTH} ! "
+        # pixel-aspect-ratio=1/1 forces videoscale to adjust HEIGHT (true
+        # downscale) instead of squashing pixels — otherwise width=1280 on a
+        # 1080p source yields 1280x1080, not real 720p.
+        scale = f"videoscale ! video/x-raw,width={WIDTH},pixel-aspect-ratio=1/1 ! "
     desc = (
         f"pipewiresrc fd={fd} path={node_id} ! "
         f"videorate ! video/x-raw,framerate={FPS}/1 ! "
