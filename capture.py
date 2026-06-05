@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""
+capture.py — stream the Wayland desktop as a series of JPEG frames.
+
+It uses the xdg-desktop-portal ScreenCast API (the only way to capture a real
+Wayland desktop) to obtain a PipeWire video stream, then GStreamer encodes each
+frame to JPEG. Frames are written to stdout, each prefixed with a 4-byte
+big-endian length, so a parent process (our Go host) can read them as a stream.
+
+Env knobs:
+  SCREENLINK_FPS      target frames per second (default 12)
+  SCREENLINK_QUALITY  JPEG quality 1-100      (default 70)
+  SCREENLINK_WIDTH    scale to this width, keeping aspect (0 = native)
+
+A restore token is cached so repeat runs don't re-prompt for permission.
+"""
+
+import os
+import sys
+import signal
+import gi
+gi.require_version("Gst", "1.0")
+from gi.repository import GLib, Gst
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+
+FPS = int(os.environ.get("SCREENLINK_FPS", "12"))
+QUALITY = int(os.environ.get("SCREENLINK_QUALITY", "70"))
+WIDTH = int(os.environ.get("SCREENLINK_WIDTH", "0"))
+
+TOKEN_FILE = os.path.expanduser("~/.config/screenlink/restore_token")
+
+
+def log(*a):
+    print("[capture]", *a, file=sys.stderr, flush=True)
+
+
+DBusGMainLoop(set_as_default=True)
+Gst.init(None)
+
+bus = dbus.SessionBus()
+portal = bus.get_object("org.freedesktop.portal.Desktop",
+                        "/org/freedesktop/portal/desktop")
+screencast = dbus.Interface(portal, "org.freedesktop.portal.ScreenCast")
+sender = bus.get_unique_name()[1:].replace(".", "_")
+loop = GLib.MainLoop()
+state = {"session": None, "node_id": None, "n": 0}
+out = sys.stdout.buffer
+
+
+def new_token(kind):
+    state["n"] += 1
+    return f"screenlink_{kind}_{state['n']}"
+
+
+def on_request(handle, cb):
+    obj = bus.get_object("org.freedesktop.portal.Desktop", handle)
+    iface = dbus.Interface(obj, "org.freedesktop.portal.Request")
+    sig = []
+
+    def handler(response, results):
+        if sig:
+            sig[0].remove()
+        if response != 0:
+            fail(f"portal denied/cancelled (response={response})")
+            return
+        cb(results)
+
+    sig.append(iface.connect_to_signal("Response", handler))
+
+
+def fail(msg):
+    log("FAIL:", msg)
+    loop.quit()
+    sys.exit(1)
+
+
+def load_token():
+    try:
+        with open(TOKEN_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def save_token(tok):
+    if not tok:
+        return
+    os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+    with open(TOKEN_FILE, "w") as f:
+        f.write(tok)
+
+
+def create_session():
+    token = new_token("create")
+    handle = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    on_request(handle, got_session)
+    screencast.CreateSession({
+        "handle_token": token,
+        "session_handle_token": new_token("session"),
+    })
+
+
+def got_session(results):
+    state["session"] = results["session_handle"]
+    select_sources()
+
+
+def select_sources():
+    token = new_token("select")
+    handle = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    on_request(handle, lambda r: start())
+    screencast.SelectSources(state["session"], {
+        "handle_token": token,
+        "types": dbus.UInt32(1),        # MONITOR (whole screen)
+        "multiple": False,
+        "cursor_mode": dbus.UInt32(2),  # draw the cursor into the video
+        "persist_mode": dbus.UInt32(2), # remember permission until revoked
+    })
+
+
+def start():
+    token = new_token("start")
+    handle = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    on_request(handle, got_streams)
+    opts = {"handle_token": token}
+    tok = load_token()
+    if tok:
+        opts["restore_token"] = tok
+    else:
+        log("a 'Share your screen?' dialog should appear — approve it once.")
+    screencast.Start(state["session"], "", opts)
+
+
+def got_streams(results):
+    if results.get("restore_token"):
+        save_token(str(results["restore_token"]))
+    streams = results.get("streams")
+    if not streams:
+        fail("no streams returned")
+    state["node_id"] = int(streams[0][0])
+    open_remote()
+
+
+def open_remote():
+    fd = screencast.OpenPipeWireRemote(state["session"], {}).take()
+    start_pipeline(fd, state["node_id"])
+
+
+def start_pipeline(fd, node_id):
+    scale = ""
+    if WIDTH > 0:
+        scale = f"videoscale ! video/x-raw,width={WIDTH} ! "
+    desc = (
+        f"pipewiresrc fd={fd} path={node_id} ! "
+        f"videorate ! video/x-raw,framerate={FPS}/1 ! "
+        f"{scale}videoconvert ! "
+        f"jpegenc quality={QUALITY} ! "
+        f"appsink name=sink emit-signals=true max-buffers=2 drop=true"
+    )
+    log("pipeline:", desc)
+    pipeline = Gst.parse_launch(desc)
+    sink = pipeline.get_by_name("sink")
+    sink.connect("new-sample", on_sample)
+    pipeline.set_state(Gst.State.PLAYING)
+    log(f"streaming at {FPS}fps q{QUALITY}" + (f" width={WIDTH}" if WIDTH else " (native)"))
+
+
+def on_sample(sink):
+    sample = sink.emit("pull-sample")
+    if sample is None:
+        return Gst.FlowReturn.OK
+    buf = sample.get_buffer()
+    ok, m = buf.map(Gst.MapFlags.READ)
+    if ok:
+        data = bytes(m.data)   # copy out before unmap
+        buf.unmap(m)
+        try:
+            out.write(len(data).to_bytes(4, "big"))
+            out.write(data)
+            out.flush()
+        except BrokenPipeError:
+            loop.quit()         # parent (Go host) went away
+    return Gst.FlowReturn.OK
+
+
+signal.signal(signal.SIGINT, lambda *_: loop.quit())
+signal.signal(signal.SIGTERM, lambda *_: loop.quit())
+create_session()
+loop.run()

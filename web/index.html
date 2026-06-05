@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>screenlink</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+  #screen {
+    display: block;
+    width: 100vw; height: 100vh;
+    object-fit: contain;     /* show whole desktop, letterboxed */
+    background: #000;
+  }
+  #status {
+    position: fixed; top: 8px; left: 8px;
+    font: 12px/1.4 system-ui, sans-serif; color: #9f9;
+    background: rgba(0,0,0,.5); padding: 4px 8px; border-radius: 4px;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <!-- MJPEG: the browser renders a multipart/x-mixed-replace stream natively,
+       so live view needs no JavaScript at all. Input control (mouse/keyboard)
+       comes in Phase 2 and will be layered on top of this. -->
+  <img id="screen" src="/stream" alt="remote screen">
+  <div id="status">screenlink — live (view only)</div>
+</body>
+</html>
