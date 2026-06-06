@@ -18,11 +18,17 @@ A restore token is cached so repeat runs don't re-prompt for permission.
 import os
 import sys
 import signal
+import ctypes
+import warnings
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst
 import dbus
 from dbus.mainloop.glib import DBusGMainLoop
+
+# Cosmetic: silence the unix_fd_add_full deprecation notice (the replacement
+# isn't available everywhere yet).
+warnings.filterwarnings("ignore", message=".*unix_fd_add_full.*")
 
 FPS = int(os.environ.get("SCREENLINK_FPS", "12"))
 QUALITY = int(os.environ.get("SCREENLINK_QUALITY", "70"))
@@ -33,6 +39,15 @@ TOKEN_FILE = os.path.expanduser("~/.config/screenlink/restore_token")
 
 def log(*a):
     print("[capture]", *a, file=sys.stderr, flush=True)
+
+
+def die_with_parent():
+    # PR_SET_PDEATHSIG: ask the kernel to SIGKILL us if the Go host dies, so a
+    # crashed/killed host never leaves an orphaned capture.py encoding forever.
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)
+    except Exception:
+        pass  # best effort; Linux-only and non-critical
 
 
 DBusGMainLoop(set_as_default=True)
@@ -224,11 +239,17 @@ def on_sample(sink):
             out.write(data)
             out.flush()
         except BrokenPipeError:
-            loop.quit()         # parent (Go host) went away
+            # Parent (Go host) went away. We're on a GStreamer thread mid-stream;
+            # returning to the Python finalizer while other GStreamer threads are
+            # still live triggers a fatal interpreter-shutdown race, so exit hard.
+            os._exit(0)
     return Gst.FlowReturn.OK
 
 
-signal.signal(signal.SIGINT, lambda *_: loop.quit())
-signal.signal(signal.SIGTERM, lambda *_: loop.quit())
+# Exit hard on these too, for the same reason: don't let the interpreter finalize
+# while GStreamer streaming threads may still call back into Python.
+signal.signal(signal.SIGINT, lambda *_: os._exit(0))
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+die_with_parent()
 create_session()
 loop.run()
