@@ -49,18 +49,46 @@ In the browser: **click the screen to take control**, then your mouse, scroll
 wheel, and keyboard drive the remote desktop. Press **Esc** to release control
 (so local browser shortcuts work again).
 
-## Build & run
+## Install & run
+
+One command, same on every platform — installs the `screenlink` CLI onto your
+`PATH` (needs [Go](https://go.dev/dl) ≥ 1.22):
 
 ```sh
-make build                 # -> bin/screenlink (+ copies capture.py next to it)
-make run                   # serves on :8087
+go install github.com/mohdafwan/screenlink@latest
+```
 
-# or directly:
-./bin/screenlink host --addr :8087 --fps 12 --quality 70 --width 0
+Then the three subcommands work the same everywhere:
+
+```sh
+screenlink host                       # share THIS screen (Linux/Wayland only)
+screenlink connect --relay … --pin … <address>   # view/control a remote host
+screenlink relay                      # run a relay
+```
+
+Hosting needs `capture.py` next to the binary; the simplest way to host is from
+a clone of the repo:
+
+```sh
+git clone https://github.com/mohdafwan/screenlink && cd screenlink
+make run                   # build + serve on :8087  (or: go run . host)
 ```
 
 Then open **http://localhost:8087** in a browser. The first run pops a
 "Share your screen?" dialog — approve it once (the permission is remembered).
+The `connect` and `relay` subcommands don't need `capture.py`, so `go install`
+alone is enough for those.
+
+Flags:
+
+| flag | meaning | default |
+|---|---|---|
+| `--addr` | address to serve the viewer on | `:8087` |
+| `--fps` | max capture frames per second (adaptive ceiling) | `40` |
+| `--quality` | max JPEG quality 1–100 (adaptive ceiling) | `70` |
+| `--width` | downscale to this width (0 = native) | `0` |
+| `--min-quality` | lowest quality adaptive will drop to | `20` |
+| `--no-adaptive` | hold `--quality`/`--fps` fixed (no auto-tuning) | off |
 
 Flags:
 
@@ -137,32 +165,27 @@ are pure Go and run anywhere, so you can control a Linux box *from* Windows/macO
 browser: `http://HOST-IP:8087`. View and control both work in the browser; no
 screenlink download required.
 
-**B. View over the internet — needs the `screenlink connect` proxy.** Get a
-binary onto the Windows/Mac machine, then point it at the relay.
-
-Easiest: cross-compile the `.exe` from any machine that has Go (e.g. the Linux
-host) and copy it over — no Go install needed on Windows:
+**B. View over the internet — needs the `screenlink connect` proxy.** Install the
+CLI with the *same one command* as on Linux (no `.exe` to build or copy — just
+[Go](https://go.dev/dl) on the machine):
 
 ```sh
-GOOS=windows GOARCH=amd64 go build -o screenlink.exe .   # Windows
-GOOS=darwin  GOARCH=arm64 go build -o screenlink     .   # Apple Silicon mac
+go install github.com/mohdafwan/screenlink@latest
 ```
 
-Or build natively on Windows: install Go from <https://go.dev/dl>, clone this
-repo, and run `go build -o screenlink.exe .`.
+Then connect using the address + passcode the host printed — identical command on
+Windows, macOS, and Linux:
 
-Then connect using the address + passcode the host printed:
-
-```powershell
-screenlink.exe connect --relay RELAY_HOST:9000 --pin 408915 707490730
+```sh
+screenlink connect --relay RELAY_HOST:9000 --pin 408915 707490730
 # Open the remote desktop at:  http://localhost:8087
 ```
 
-You can also run the relay itself on Windows: `screenlink.exe relay --addr :9000`.
+You can also run the relay anywhere the same way: `screenlink relay --addr :9000`.
 
-> `screenlink.exe host` is present but will fail to capture on Windows — hosting
-> from Windows would need a separate backend (DXGI Desktop Duplication for
-> capture + the Win32 `SendInput` API for control), i.e. a future "Windows host".
+> `screenlink host` is present off Linux but can't capture there — hosting from
+> Windows would need a separate backend (DXGI Desktop Duplication for capture +
+> the Win32 `SendInput` API for control), i.e. a future "Windows host".
 
 ## How it fits together
 

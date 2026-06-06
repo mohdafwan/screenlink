@@ -24,12 +24,12 @@ import (
 	"strings"
 	"time"
 
-	"screenlink/internal/adaptive"
-	"screenlink/internal/capture"
-	"screenlink/internal/hub"
-	"screenlink/internal/input"
-	"screenlink/internal/relay"
-	"screenlink/internal/wsock"
+	"github.com/mohdafwan/screenlink/internal/adaptive"
+	"github.com/mohdafwan/screenlink/internal/capture"
+	"github.com/mohdafwan/screenlink/internal/hub"
+	"github.com/mohdafwan/screenlink/internal/input"
+	"github.com/mohdafwan/screenlink/internal/relay"
+	"github.com/mohdafwan/screenlink/internal/wsock"
 )
 
 //go:embed web/index.html
