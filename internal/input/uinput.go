@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package input injects mouse and keyboard events into the local Wayland
 // session by creating a virtual device through the kernel's uinput interface.
 //

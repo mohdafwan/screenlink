@@ -125,6 +125,45 @@ passcode instead of a random one.
 > your own relay, or wait for the TLS/E2E-encryption follow-up before using this
 > over an untrusted network.
 
+## Running on Windows / macOS
+
+screenlink can only **host** (share a screen) on **Linux/Wayland** — capture
+(xdg-desktop-portal + PipeWire + GStreamer) and control (`/dev/uinput`) are
+Linux-only. Windows/macOS can't be the host. But the **viewer** and **relay**
+are pure Go and run anywhere, so you can control a Linux box *from* Windows/macOS.
+
+**A. View on the same LAN — no install needed.** On the Linux host run
+`screenlink host`, then on the Windows/Mac machine just open the host's URL in a
+browser: `http://HOST-IP:8087`. View and control both work in the browser; no
+screenlink download required.
+
+**B. View over the internet — needs the `screenlink connect` proxy.** Get a
+binary onto the Windows/Mac machine, then point it at the relay.
+
+Easiest: cross-compile the `.exe` from any machine that has Go (e.g. the Linux
+host) and copy it over — no Go install needed on Windows:
+
+```sh
+GOOS=windows GOARCH=amd64 go build -o screenlink.exe .   # Windows
+GOOS=darwin  GOARCH=arm64 go build -o screenlink     .   # Apple Silicon mac
+```
+
+Or build natively on Windows: install Go from <https://go.dev/dl>, clone this
+repo, and run `go build -o screenlink.exe .`.
+
+Then connect using the address + passcode the host printed:
+
+```powershell
+screenlink.exe connect --relay RELAY_HOST:9000 --pin 408915 707490730
+# Open the remote desktop at:  http://localhost:8087
+```
+
+You can also run the relay itself on Windows: `screenlink.exe relay --addr :9000`.
+
+> `screenlink.exe host` is present but will fail to capture on Windows — hosting
+> from Windows would need a separate backend (DXGI Desktop Duplication for
+> capture + the Win32 `SendInput` API for control), i.e. a future "Windows host".
+
 ## How it fits together
 
 ```

@@ -1,3 +1,5 @@
+//go:build linux
+
 package input
 
 // keymap translates browser KeyboardEvent.code strings to Linux input event
