@@ -15,7 +15,7 @@ WebSocket, where the host replays them through the kernel's **uinput** device.
 - [x] **Phase 1 — live screen in the browser (view only)** ✅
 - [x] **Phase 2 — mouse/keyboard control (browser → host via uinput)** ✅
 - [x] **Phase 3 — connect over the internet via a relay (AnyDesk-style ID)** ✅
-- [ ] Phase 4 — bandwidth: downscale / delta / H.264 instead of full JPEG frames
+- [x] **Phase 4 — adaptive bitrate (auto quality + fps to fit the link)** ✅
 
 ## Requirements (already present on this machine)
 
@@ -67,13 +67,25 @@ Flags:
 | flag | meaning | default |
 |---|---|---|
 | `--addr` | address to serve the viewer on | `:8087` |
-| `--fps` | capture frames per second | `12` |
-| `--quality` | JPEG quality 1–100 | `70` |
+| `--fps` | max capture frames per second (adaptive ceiling) | `40` |
+| `--quality` | max JPEG quality 1–100 (adaptive ceiling) | `70` |
 | `--width` | downscale to this width (0 = native) | `0` |
+| `--min-quality` | lowest quality adaptive will drop to | `20` |
+| `--no-adaptive` | hold `--quality`/`--fps` fixed (no auto-tuning) | off |
 
-Lower `--fps`/`--quality` or set `--width 1280` to cut bandwidth (native 1080p
-JPEG is ~5 MB/s — fine on a LAN, too heavy for the open internet; Phase 4
-addresses this).
+### Adaptive bitrate (Phase 4)
+
+By default the host **auto-tunes** to what the viewer can actually receive. Once
+a second it checks how many frames viewers are dropping and steps a 5-rung
+quality+fps ladder: it backs off fast when the link is congested and climbs back
+toward `--quality`/`--fps` when there's headroom. `--quality` and `--fps` are the
+*ceilings*; `--min-quality` is the floor.
+
+Both levers are low-latency — no transcoding, no buffering. Quality is changed
+live on the GStreamer encoder; fps is capped host-side. At the floor a frame is
+~2.3× smaller and sent ~5× less often than at full quality (≈10× less
+bandwidth). Resolution stays fixed (`--width`) since changing it live would
+flicker. Use `--no-adaptive` to pin a constant quality/fps.
 
 ## Connecting over the internet (Phase 3)
 
@@ -132,8 +144,9 @@ passcode instead of a random one.
 main.go                      CLI: host / connect / relay subcommands
 capture.py                   portal + PipeWire + GStreamer -> JPEG frame stream
 web/index.html               the viewer (<img src="/stream"> + input capture)
-internal/capture/capture.go  spawns capture.py, parses its frame stream
-internal/hub/hub.go          fans the latest frame out to all viewers
+internal/capture/capture.go  spawns capture.py, parses frames, retunes quality live
+internal/hub/hub.go          fans the latest frame out to all viewers + drop stats
+internal/adaptive/adaptive.go bandwidth ladder + fps gate (auto quality/fps)
 internal/input/uinput.go     virtual mouse+keyboard via /dev/uinput (no daemon)
 internal/input/keymap.go     browser KeyboardEvent.code -> Linux keycodes
 internal/wsock/wsock.go      minimal dependency-free WebSocket server

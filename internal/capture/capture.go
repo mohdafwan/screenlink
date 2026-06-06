@@ -3,6 +3,9 @@
 // PipeWire stack, which is far easier from Python's gi bindings than from Go,
 // so the OS-specific capture lives in capture.py and Go just consumes its
 // length-prefixed frame stream.
+//
+// The host can also retune the encoder at runtime (Phase 4, adaptive bitrate)
+// by sending one-line commands to capture.py's stdin via SetQuality.
 package capture
 
 import (
@@ -12,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"sync"
 )
 
 // Options configure the capture helper.
@@ -22,9 +26,18 @@ type Options struct {
 	Width   int // 0 = native resolution
 }
 
-// Frames spawns capture.py and calls onFrame for every JPEG frame until the
-// helper exits or an error occurs. It blocks; run it in a goroutine.
-func Frames(opts Options, onFrame func([]byte)) error {
+// Capturer is a running capture.py process.
+type Capturer struct {
+	cmd   *exec.Cmd
+	mu    sync.Mutex
+	stdin io.WriteCloser
+}
+
+// Start launches capture.py and streams every JPEG frame to onFrame from a
+// background goroutine. It returns once the process has started; when capture
+// ends (EOF or error) it calls onDone with the cause. Run it for the lifetime
+// of the host.
+func Start(opts Options, onFrame func([]byte), onDone func(error)) (*Capturer, error) {
 	cmd := exec.Command("python3", opts.Script)
 	cmd.Stderr = os.Stderr // let the helper's [capture] logs through
 	cmd.Env = append(os.Environ(),
@@ -32,18 +45,34 @@ func Frames(opts Options, onFrame func([]byte)) error {
 		"SCREENLINK_QUALITY="+strconv.Itoa(opts.Quality),
 		"SCREENLINK_WIDTH="+strconv.Itoa(opts.Width),
 	)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start capture.py: %w", err)
+		return nil, fmt.Errorf("start capture.py: %w", err)
 	}
 
-	readErr := readFrames(stdout, onFrame)
-	_ = cmd.Process.Kill()
-	cmd.Wait()
-	return readErr
+	c := &Capturer{cmd: cmd, stdin: stdin}
+	go func() {
+		readErr := readFrames(stdout, onFrame)
+		_ = cmd.Process.Kill()
+		cmd.Wait()
+		onDone(readErr)
+	}()
+	return c, nil
+}
+
+// SetQuality asks the encoder to switch to JPEG quality q (1-100) on the fly.
+func (c *Capturer) SetQuality(q int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, err := fmt.Fprintf(c.stdin, "QUALITY %d\n", q)
+	return err
 }
 
 // readFrames parses the [4-byte length][jpeg] stream.

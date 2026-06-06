@@ -158,15 +158,56 @@ def start_pipeline(fd, node_id):
         f"pipewiresrc fd={fd} path={node_id} ! "
         f"videorate ! video/x-raw,framerate={FPS}/1 ! "
         f"{scale}videoconvert ! "
-        f"jpegenc quality={QUALITY} ! "
+        f"jpegenc quality={QUALITY} name=enc ! "
         f"appsink name=sink emit-signals=true max-buffers=2 drop=true"
     )
     log("pipeline:", desc)
     pipeline = Gst.parse_launch(desc)
     sink = pipeline.get_by_name("sink")
     sink.connect("new-sample", on_sample)
+    state["enc"] = pipeline.get_by_name("enc")
     pipeline.set_state(Gst.State.PLAYING)
     log(f"streaming at {FPS}fps q{QUALITY}" + (f" width={WIDTH}" if WIDTH else " (native)"))
+    watch_stdin()  # let the Go host retune quality at runtime (adaptive bitrate)
+
+
+# --- runtime control: the host writes one-line commands to our stdin ---
+
+_stdin_buf = b""
+
+
+def handle_cmd(line):
+    # Currently the only command: "QUALITY <1-100>" — adjust JPEG quality live.
+    parts = line.split()
+    if len(parts) == 2 and parts[0] == "QUALITY":
+        enc = state.get("enc")
+        try:
+            q = max(1, min(100, int(parts[1])))
+        except ValueError:
+            return
+        if enc is not None:
+            enc.set_property("quality", q)
+
+
+def on_stdin(fd, _cond):
+    global _stdin_buf
+    try:
+        data = os.read(fd, 4096)
+    except (BlockingIOError, OSError):
+        return True
+    if not data:
+        return False  # host closed stdin; stop watching
+    _stdin_buf += data
+    while b"\n" in _stdin_buf:
+        line, _stdin_buf = _stdin_buf.split(b"\n", 1)
+        handle_cmd(line.decode(errors="ignore").strip())
+    return True
+
+
+def watch_stdin():
+    fd = sys.stdin.fileno()
+    os.set_blocking(fd, False)
+    GLib.unix_fd_add_full(GLib.PRIORITY_DEFAULT, fd, GLib.IOCondition.IN, on_stdin)
 
 
 def on_sample(sink):

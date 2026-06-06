@@ -22,7 +22,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"screenlink/internal/adaptive"
 	"screenlink/internal/capture"
 	"screenlink/internal/hub"
 	"screenlink/internal/input"
@@ -69,6 +71,8 @@ func runHost(args []string) {
 	noInput := fs.Bool("no-input", false, "disable remote control (view-only); the viewer cannot move the mouse or type")
 	relayAddr := fs.String("relay", "", "register with this relay (HOST:PORT) for AnyDesk-style internet access")
 	pin := fs.String("pin", "", "passcode viewers must present (default: a random 6-digit code)")
+	minQuality := fs.Int("min-quality", 20, "lowest JPEG quality the adaptive controller will drop to")
+	noAdaptive := fs.Bool("no-adaptive", false, "disable adaptive bitrate; hold --quality/--fps fixed")
 	fs.Parse(args)
 
 	capturePath := resolveCapture(*script)
@@ -78,19 +82,35 @@ func runHost(args []string) {
 
 	h := hub.New()
 
-	// Start capturing in the background; frames flow into the hub.
-	go func() {
-		err := capture.Frames(capture.Options{
-			Script:  capturePath,
-			FPS:     *fpsFlag,
-			Quality: *quality,
-			Width:   *width,
-		}, h.Publish)
-		if err != nil {
-			log.Fatalf("capture stopped: %v", err)
-		}
-		log.Fatal("capture exited")
-	}()
+	// fps gate sits between capture and the hub so the adaptive controller can
+	// throttle forwarded frames without touching the GStreamer pipeline.
+	gate := adaptive.NewGate(*fpsFlag)
+
+	cap, err := capture.Start(
+		capture.Options{Script: capturePath, FPS: *fpsFlag, Quality: *quality, Width: *width},
+		func(frame []byte) {
+			if gate.Allow() {
+				h.Publish(frame)
+			}
+		},
+		func(err error) {
+			if err != nil {
+				log.Fatalf("capture stopped: %v", err)
+			}
+			log.Fatal("capture exited")
+		},
+	)
+	if err != nil {
+		log.Fatalf("start capture: %v", err)
+	}
+
+	// Adaptive bitrate (Phase 4): once per second, nudge quality/fps toward what
+	// viewers can keep up with.
+	if !*noAdaptive {
+		ctrl := adaptive.NewController(*quality, *minQuality, *fpsFlag)
+		go adaptiveLoop(ctrl, h, cap, gate)
+		log.Printf("adaptive bitrate on (quality %d..%d, fps up to %d)", *minQuality, *quality, *fpsFlag)
+	}
 
 	// Set up remote control (Phase 2). If uinput is unavailable we degrade to
 	// view-only rather than refusing to start.
@@ -231,6 +251,35 @@ func dispatch(in *input.Injector, ev inputEvent) {
 	}
 }
 
+// adaptiveLoop tunes encoder quality + forwarded fps once a second based on how
+// well viewers are keeping up (Phase 4).
+func adaptiveLoop(ctrl *adaptive.Controller, h *hub.Hub, cap *capture.Capturer, gate *adaptive.Gate) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	var prev hub.Stats
+	for range t.C {
+		s := h.Stats()
+		dd, dr := diff(s.Delivered, prev.Delivered), diff(s.Dropped, prev.Dropped)
+		prev = s
+		if s.Subscribers == 0 {
+			continue // nobody watching; leave settings as-is
+		}
+		if lv, changed := ctrl.Tune(dd, dr); changed {
+			cap.SetQuality(lv.Quality)
+			gate.SetTarget(lv.FPS)
+			log.Printf("adaptive: quality=%d fps=%d (delivered=%d dropped=%d)", lv.Quality, lv.FPS, dd, dr)
+		}
+	}
+}
+
+// diff returns now-prev, or 0 if the counter fell (a viewer left mid-interval).
+func diff(now, prev uint64) uint64 {
+	if now >= prev {
+		return now - prev
+	}
+	return 0
+}
+
 // streamHandler serves an endless multipart/x-mixed-replace JPEG stream that an
 // <img> tag renders as live video.
 func streamHandler(h *hub.Hub) http.HandlerFunc {
@@ -244,14 +293,14 @@ func streamHandler(h *hub.Hub) http.HandlerFunc {
 		w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+boundary)
 		w.Header().Set("Cache-Control", "no-store")
 
-		ch := h.Subscribe()
-		defer h.Unsubscribe(ch)
+		sub := h.Subscribe()
+		defer h.Unsubscribe(sub)
 
 		for {
 			select {
 			case <-r.Context().Done():
 				return
-			case frame := <-ch:
+			case frame := <-sub.C:
 				_, err := fmt.Fprintf(w, "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", boundary, len(frame))
 				if err != nil {
 					return
