@@ -12,6 +12,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"flag"
@@ -73,6 +74,7 @@ func runHost(args []string) {
 	pin := fs.String("pin", "", "passcode viewers must present (default: a random 6-digit code)")
 	minQuality := fs.Int("min-quality", 20, "lowest JPEG quality the adaptive controller will drop to")
 	noAdaptive := fs.Bool("no-adaptive", false, "disable adaptive bitrate; hold --quality/--fps fixed")
+	password := fs.String("password", "", "require this password (HTTP Basic Auth) — strongly recommended when exposing via a tunnel")
 	fs.Parse(args)
 
 	capturePath := resolveCapture(*script)
@@ -131,14 +133,40 @@ func runHost(args []string) {
 	mux.HandleFunc("/input", inputHandler(injector))
 	mux.HandleFunc("/", indexHandler(injector != nil))
 
+	// Optional password gate. Essential when exposing the host through a public
+	// tunnel (cloudflared/ngrok), where there's no relay passcode in front.
+	var handler http.Handler = mux
+	if *password != "" {
+		handler = basicAuth(mux, *password)
+		log.Printf("password protection on (HTTP Basic Auth)")
+	} else if *relayAddr == "" {
+		log.Printf("WARNING: no --password set; anyone who reaches this address can view+control. Set --password before tunneling.")
+	}
+
 	// Always serve locally (direct/LAN access). If a relay is configured, also
 	// register with it so viewers can reach us over the internet.
 	log.Printf("screenlink host: local viewer at http://localhost%s  (capture=%s)", normalizeAddr(*addr), capturePath)
 	if *relayAddr != "" {
-		go func() { log.Fatal(http.ListenAndServe(*addr, mux)) }()
-		log.Fatal(relay.ServeHTTP(*relayAddr, *pin, mux))
+		go func() { log.Fatal(http.ListenAndServe(*addr, handler)) }()
+		log.Fatal(relay.ServeHTTP(*relayAddr, *pin, handler))
 	}
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	log.Fatal(http.ListenAndServe(*addr, handler))
+}
+
+// basicAuth wraps h so every request must carry the given password via HTTP
+// Basic Auth (any username). Browsers prompt once and then attach the
+// credentials to every request — including the /input WebSocket upgrade — so it
+// works transparently behind a tunnel.
+func basicAuth(h http.Handler, password string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, pass, ok := r.BasicAuth()
+		if !ok || subtle.ConstantTimeCompare([]byte(pass), []byte(password)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="screenlink"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // runConnect is the viewer side: a local proxy that tunnels the browser to a
