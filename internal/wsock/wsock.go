@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 // magic GUID from RFC 6455 §1.3 used to derive the accept key.
@@ -27,6 +28,7 @@ const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 type Conn struct {
 	conn net.Conn
 	br   *bufio.Reader
+	wmu  sync.Mutex // serializes frame writes (frame sender + pong replies)
 }
 
 // opcodes
@@ -140,6 +142,10 @@ func (c *Conn) readFrame() (byte, []byte, error) {
 	return op, payload, nil
 }
 
+// WriteBinary sends payload to the client as one binary message (used to push
+// JPEG frames). Safe to call concurrently with ReadMessage.
+func (c *Conn) WriteBinary(payload []byte) error { return c.writeFrame(opBinary, payload) }
+
 // writeFrame writes a single unmasked server frame.
 func (c *Conn) writeFrame(op byte, payload []byte) error {
 	var hdr []byte
@@ -155,6 +161,8 @@ func (c *Conn) writeFrame(op byte, payload []byte) error {
 		hdr[0], hdr[1] = b0, 127
 		binary.BigEndian.PutUint64(hdr[2:], uint64(n))
 	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	if _, err := c.conn.Write(hdr); err != nil {
 		return err
 	}

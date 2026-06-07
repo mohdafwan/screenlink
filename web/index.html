@@ -29,64 +29,71 @@
 </style>
 </head>
 <body>
-  <!-- MJPEG: the browser renders the multipart/x-mixed-replace stream natively.
-       Phase 2 layers mouse/keyboard control on top via a WebSocket to /input. -->
-  <img id="screen" src="/stream" alt="remote screen" draggable="false">
-  <div id="status">screenlink</div>
+  <!-- Frames arrive as binary WebSocket messages and are painted into this <img>
+       via blob URLs. A WebSocket (unlike MJPEG) is a raw passthrough that CDNs/
+       tunnels don't buffer, so the view stays real-time over a cloudflared URL;
+       and on an https page it's wss://, so control isn't blocked as mixed
+       content. Input events go back over the same socket. -->
+  <img id="screen" alt="remote screen" draggable="false">
+  <div id="status">screenlink — connecting…</div>
   <div id="hint"></div>
 
 <script>
 "use strict";
-// The placeholder below is replaced server-side with true/false depending on
-// whether the host could open /dev/uinput (see indexHandler in main.go).
+// Replaced server-side with true/false depending on whether the host could open
+// /dev/uinput (see indexHandler in main.go). Controls whether input is forwarded;
+// the live view works either way.
 const CONTROL = __CONTROL__;
 
 const img = document.getElementById("screen");
 const statusEl = document.getElementById("status");
 const hintEl = document.getElementById("hint");
+if (!CONTROL) document.body.classList.add("viewonly");
 
-if (!CONTROL) {
-  document.body.classList.add("viewonly");
-  statusEl.textContent = "screenlink — live (view only)";
-  hintEl.textContent = "remote control unavailable on the host";
-} else {
-  startControl();
+let ws, wsReady = false;
+let controlling = false;     // are we actively forwarding input?
+let curURL = null;           // current blob URL backing the <img>
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss://" : "ws://";
+  ws = new WebSocket(`${proto}${location.host}/ws`);
+  ws.binaryType = "blob";
+  ws.onopen = () => { wsReady = true; render(); };
+  ws.onmessage = (e) => {
+    if (typeof e.data === "string") return;       // server only sends binary frames
+    const url = URL.createObjectURL(e.data);
+    img.src = url;
+    if (curURL) URL.revokeObjectURL(curURL);      // free the previous frame
+    curURL = url;
+  };
+  ws.onclose = () => { wsReady = false; controlling = false; render(); setTimeout(connect, 1000); };
+  ws.onerror = () => ws.close();
+}
+connect();
+
+function send(obj) {
+  if (wsReady && controlling) ws.send(JSON.stringify(obj));
 }
 
-function startControl() {
-  let ws, wsReady = false;
-  let controlling = false; // are we actively forwarding input?
+// Map a pointer event to a fraction (0..1) of the actual desktop, accounting for
+// object-fit: contain letterboxing (black bars around the image).
+function toFraction(e) {
+  const r = img.getBoundingClientRect();
+  const natW = img.naturalWidth || r.width;
+  const natH = img.naturalHeight || r.height;
+  const scale = Math.min(r.width / natW, r.height / natH);
+  const dispW = natW * scale, dispH = natH * scale;
+  const offX = r.left + (r.width - dispW) / 2;
+  const offY = r.top + (r.height - dispH) / 2;
+  const x = (e.clientX - offX) / dispW;
+  const y = (e.clientY - offY) / dispH;
+  return { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) };
+}
 
-  function connect() {
-    ws = new WebSocket(`ws://${location.host}/input`);
-    ws.onopen = () => { wsReady = true; render(); };
-    ws.onclose = () => { wsReady = false; controlling = false; render(); setTimeout(connect, 1000); };
-    ws.onerror = () => ws.close();
-  }
-  connect();
+function engage() { if (CONTROL && wsReady) { controlling = true; render(); } }
+function release() { controlling = false; render(); }
 
-  function send(obj) {
-    if (wsReady && controlling) ws.send(JSON.stringify(obj));
-  }
-
-  // Map a pointer event to a fraction (0..1) of the actual desktop, accounting
-  // for object-fit: contain letterboxing (black bars around the image).
-  function toFraction(e) {
-    const r = img.getBoundingClientRect();
-    const natW = img.naturalWidth || r.width;
-    const natH = img.naturalHeight || r.height;
-    const scale = Math.min(r.width / natW, r.height / natH);
-    const dispW = natW * scale, dispH = natH * scale;
-    const offX = r.left + (r.width - dispW) / 2;
-    const offY = r.top + (r.height - dispH) / 2;
-    const x = (e.clientX - offX) / dispW;
-    const y = (e.clientY - offY) / dispH;
-    return { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) };
-  }
-
-  function engage() { if (wsReady) { controlling = true; render(); } }
-  function release() { controlling = false; render(); }
-
+if (CONTROL) {
   // Click the image to take control; Esc (or blur) gives it back so local
   // browser shortcuts work again.
   img.addEventListener("mousedown", (e) => {
@@ -102,14 +109,13 @@ function startControl() {
     send({ t: "b", b: e.button, d: false });
   });
 
-  // Coalesce mouse moves to one per animation frame to avoid flooding the WS.
+  // Coalesce mouse moves to one per animation frame to avoid flooding the socket.
   let pending = null;
   img.addEventListener("mousemove", (e) => { if (controlling) pending = toFraction(e); });
-  function pump() {
+  (function pump() {
     if (pending) { send({ t: "m", x: pending.x, y: pending.y }); pending = null; }
     requestAnimationFrame(pump);
-  }
-  requestAnimationFrame(pump);
+  })();
 
   // Right-click should reach the remote, not open the local context menu.
   img.addEventListener("contextmenu", (e) => { if (controlling) e.preventDefault(); });
@@ -124,8 +130,8 @@ function startControl() {
     if (dx || dy) send({ t: "s", x: dx, y: dy });
   }, { passive: false });
 
-  // Keyboard: forward physical keys while controlling, swallowing them locally
-  // so e.g. Ctrl+W / F5 act on the remote, not this tab. Esc releases control.
+  // Keyboard: forward physical keys while controlling, swallowing them locally so
+  // e.g. Ctrl+W / F5 act on the remote, not this tab. Esc releases control.
   window.addEventListener("keydown", (e) => {
     if (!controlling) return;
     if (e.code === "Escape") { release(); e.preventDefault(); return; }
@@ -140,21 +146,24 @@ function startControl() {
 
   // Release on blur so modifiers don't get "stuck" if the user alt-tabs away.
   window.addEventListener("blur", release);
-
-  function render() {
-    if (!wsReady) {
-      statusEl.textContent = "screenlink — reconnecting…";
-      hintEl.textContent = "";
-    } else if (controlling) {
-      statusEl.textContent = "screenlink — CONTROLLING";
-      hintEl.textContent = "Esc to release control";
-    } else {
-      statusEl.textContent = "screenlink — live";
-      hintEl.textContent = "click to take control";
-    }
-  }
-  render();
 }
+
+function render() {
+  if (!wsReady) {
+    statusEl.textContent = "screenlink — reconnecting…";
+    hintEl.textContent = "";
+  } else if (!CONTROL) {
+    statusEl.textContent = "screenlink — live (view only)";
+    hintEl.textContent = "remote control unavailable on the host";
+  } else if (controlling) {
+    statusEl.textContent = "screenlink — CONTROLLING";
+    hintEl.textContent = "Esc to release control";
+  } else {
+    statusEl.textContent = "screenlink — live";
+    hintEl.textContent = "click to take control";
+  }
+}
+render();
 </script>
 </body>
 </html>

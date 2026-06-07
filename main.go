@@ -135,7 +135,8 @@ func runHost(args []string) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/stream", streamHandler(h))
+	mux.HandleFunc("/ws", wsHandler(h, injector)) // frames out + input in, one socket
+	mux.HandleFunc("/stream", streamHandler(h))    // legacy MJPEG (LAN/no-JS fallback)
 	mux.HandleFunc("/input", inputHandler(injector))
 	mux.HandleFunc("/", indexHandler(injector != nil))
 
@@ -350,6 +351,57 @@ func inputHandler(in *input.Injector) http.HandlerFunc {
 				continue
 			}
 			dispatch(in, ev)
+		}
+	}
+}
+
+// wsHandler is the primary viewer transport: it pushes JPEG frames to the
+// browser as binary messages and receives input events as text — all on one
+// WebSocket. Unlike the MJPEG /stream, a WebSocket is a raw passthrough that
+// proxies/CDNs (e.g. a cloudflared tunnel) don't buffer, so the view stays
+// real-time, and on an https page it's wss:// so control isn't blocked as mixed
+// content.
+func wsHandler(h *hub.Hub, in *input.Injector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, err := wsock.Upgrade(w, r)
+		if err != nil {
+			http.Error(w, "websocket upgrade failed", http.StatusBadRequest)
+			return
+		}
+		defer conn.Close()
+
+		sub := h.Subscribe()
+		defer h.Unsubscribe(sub)
+
+		done := make(chan struct{})
+		// Frame sender: push the latest frame as it arrives.
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				case frame := <-sub.C:
+					if err := conn.WriteBinary(frame); err != nil {
+						return
+					}
+				}
+			}
+		}()
+
+		// Input receiver: text messages are control events.
+		for {
+			msg, err := conn.ReadMessage()
+			if err != nil {
+				close(done)
+				return
+			}
+			if in == nil {
+				continue
+			}
+			var ev inputEvent
+			if json.Unmarshal(msg, &ev) == nil {
+				dispatch(in, ev)
+			}
 		}
 	}
 }
