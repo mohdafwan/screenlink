@@ -105,30 +105,32 @@ live on the GStreamer encoder; fps is capped host-side. At the floor a frame is
 bandwidth). Resolution stays fixed (`--width`) since changing it live would
 flicker. Use `--no-adaptive` to pin a constant quality/fps.
 
-## Quickest internet access — a tunnel (no relay, no server)
-
-Since the host is just an HTTP server, the simplest way to reach it from another
-network is a generic HTTP tunnel like [`cloudflared`](https://github.com/cloudflare/cloudflared)
-(free, no account for quick tunnels). No relay, no `connect`, no public server —
-the viewer just opens a URL in a browser.
+## Quickest internet access — one command
 
 ```sh
-# on the host:
-screenlink host --password SECRET          # protect it — the URL is public!
-cloudflared tunnel --url http://localhost:8087
-#   ... https://random-words.trycloudflare.com
+screenlink host --tunnel
 ```
 
-Share that `https://…trycloudflare.com` URL; the viewer opens it in any browser
-on any network and logs in with the password. MJPEG streaming and the control
-WebSocket both pass through the tunnel.
+That's it. `--tunnel` starts the host, generates a password, launches a
+[`cloudflared`](https://github.com/cloudflare/cloudflared) tunnel, and prints a
+public URL + password:
 
-> **Always set `--password` when tunnelling** — the tunnel URL is reachable by
-> anyone, and without a password they'd get full control of your desktop. (ngrok
-> works the same way: `ngrok http 8087`.)
+```
+  ┌─────────────────────────────────────────────────────────┐
+  │  Share these with whoever should view/control this screen │
+  └─────────────────────────────────────────────────────────┘
+    URL     : https://random-words.trycloudflare.com
+    Password: 73f9902d4f
+```
+
+The other person opens that URL in **any browser on any network**, enters the
+password, and gets live view + control. No relay, no public server, nothing to
+install on their side. (`cloudflared` must be installed on the host —
+<https://github.com/cloudflare/cloudflared/releases>. `--password PW` pins your
+own password instead of a generated one.)
 
 The built-in relay below is the alternative when you want your *own* fixed
-address/passcode infrastructure (AnyDesk-style) instead of a third-party tunnel.
+address/passcode infrastructure (AnyDesk-style) instead of a cloudflare URL.
 
 ## Connecting over the internet (Phase 3)
 

@@ -12,8 +12,11 @@
 package main
 
 import (
+	"bufio"
+	"crypto/rand"
 	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,7 +24,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -54,7 +59,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  screenlink host    [--addr :8087] [--fps 40] [--quality 70] [--width 0] [--no-input] [--relay HOST:PORT] [--pin CODE]")
+	fmt.Fprintln(os.Stderr, "  screenlink host    [--tunnel] [--password PW] [--addr :8087] [--fps 40] [--quality 70] [--no-input] [--relay HOST:PORT]")
 	fmt.Fprintln(os.Stderr, "  screenlink connect [--relay HOST:PORT] [--pin CODE] [--addr :8087] <address>")
 	fmt.Fprintln(os.Stderr, "  screenlink relay   [--addr :9000]")
 	os.Exit(2)
@@ -75,6 +80,7 @@ func runHost(args []string) {
 	minQuality := fs.Int("min-quality", 20, "lowest JPEG quality the adaptive controller will drop to")
 	noAdaptive := fs.Bool("no-adaptive", false, "disable adaptive bitrate; hold --quality/--fps fixed")
 	password := fs.String("password", "", "require this password (HTTP Basic Auth) — strongly recommended when exposing via a tunnel")
+	tunnel := fs.Bool("tunnel", false, "expose the host on a public https URL automatically via cloudflared (one command, no relay)")
 	fs.Parse(args)
 
 	capturePath := resolveCapture(*script)
@@ -133,24 +139,106 @@ func runHost(args []string) {
 	mux.HandleFunc("/input", inputHandler(injector))
 	mux.HandleFunc("/", indexHandler(injector != nil))
 
-	// Optional password gate. Essential when exposing the host through a public
-	// tunnel (cloudflared/ngrok), where there's no relay passcode in front.
-	var handler http.Handler = mux
-	if *password != "" {
-		handler = basicAuth(mux, *password)
-		log.Printf("password protection on (HTTP Basic Auth)")
-	} else if *relayAddr == "" {
-		log.Printf("WARNING: no --password set; anyone who reaches this address can view+control. Set --password before tunneling.")
+	// Effective password. When tunneling we auto-generate one if none was given,
+	// so a public URL is never left wide open by accident.
+	pw := *password
+	if *tunnel && pw == "" {
+		pw = randomToken()
+		log.Printf("no --password given; generated one for the tunnel")
 	}
 
-	// Always serve locally (direct/LAN access). If a relay is configured, also
-	// register with it so viewers can reach us over the internet.
+	// Optional password gate. Essential when exposing the host through a public
+	// tunnel, where there's no relay passcode in front.
+	var handler http.Handler = mux
+	if pw != "" {
+		handler = basicAuth(mux, pw)
+		log.Printf("password protection on (HTTP Basic Auth)")
+	} else if *relayAddr == "" {
+		log.Printf("WARNING: no --password set; anyone who reaches this address can view+control.")
+	}
+
+	// Serve locally (direct/LAN access) in the background; the main goroutine then
+	// runs whichever exposure was requested (tunnel and/or relay), or just blocks.
 	log.Printf("screenlink host: local viewer at http://localhost%s  (capture=%s)", normalizeAddr(*addr), capturePath)
+	go func() { log.Fatal(http.ListenAndServe(*addr, handler)) }()
+
+	if *tunnel {
+		go runTunnel(*addr, pw)
+	}
 	if *relayAddr != "" {
-		go func() { log.Fatal(http.ListenAndServe(*addr, handler)) }()
 		log.Fatal(relay.ServeHTTP(*relayAddr, *pin, handler))
 	}
-	log.Fatal(http.ListenAndServe(*addr, handler))
+	select {} // keep serving (local + tunnel) until killed
+}
+
+// runTunnel launches cloudflared to expose the local host on a public https URL,
+// then prints that URL (and the password) front-and-centre so the whole thing is
+// a single command: `screenlink host --tunnel`.
+func runTunnel(localAddr, password string) {
+	bin := findCloudflared()
+	if bin == "" {
+		log.Printf("--tunnel: cloudflared not found. Install it from")
+		log.Printf("  https://github.com/cloudflare/cloudflared/releases  (then re-run)")
+		return
+	}
+	url := "http://localhost" + normalizeAddr(localAddr)
+	cmd := exec.Command(bin, "tunnel", "--url", url)
+	stderr, err := cmd.StderrPipe()
+	if err != nil || cmd.Start() != nil {
+		log.Printf("--tunnel: could not start cloudflared: %v", err)
+		return
+	}
+
+	re := regexp.MustCompile(`https://[a-z0-9-]+\.trycloudflare\.com`)
+	sc := bufio.NewScanner(stderr)
+	for sc.Scan() {
+		if m := re.FindString(sc.Text()); m != "" {
+			printShareBox(m, password)
+			break
+		}
+	}
+	cmd.Wait()
+}
+
+// findCloudflared locates the cloudflared binary on PATH or common install dirs.
+func findCloudflared() string {
+	if p, err := exec.LookPath("cloudflared"); err == nil {
+		return p
+	}
+	home, _ := os.UserHomeDir()
+	for _, p := range []string{
+		filepath.Join(home, "go", "bin", "cloudflared"),
+		"/usr/local/bin/cloudflared",
+		"/usr/bin/cloudflared",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// printShareBox prints the public URL and password the viewer needs.
+func printShareBox(url, password string) {
+	fmt.Println()
+	fmt.Println("  ┌─────────────────────────────────────────────────────────┐")
+	fmt.Println("  │  Share these with whoever should view/control this screen │")
+	fmt.Println("  └─────────────────────────────────────────────────────────┘")
+	fmt.Printf("    URL     : %s\n", url)
+	if password != "" {
+		fmt.Printf("    Password: %s\n", password)
+	}
+	fmt.Println()
+	fmt.Println("  They just open the URL in any browser, on any network.")
+	fmt.Println("  (Ctrl-C here stops sharing.)")
+	fmt.Println()
+}
+
+// randomToken returns a short URL-safe password.
+func randomToken() string {
+	var b [5]byte
+	rand.Read(b[:])
+	return hex.EncodeToString(b[:]) // 10 hex chars
 }
 
 // basicAuth wraps h so every request must carry the given password via HTTP
