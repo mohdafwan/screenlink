@@ -83,6 +83,25 @@ func runHost(args []string) {
 	tunnel := fs.Bool("tunnel", false, "expose the host on a public https URL automatically via cloudflared (one command, no relay)")
 	fs.Parse(args)
 
+	// Internet links (a tunnel or a relay) can't carry native 1080p@40fps —
+	// that's ~15 MB/s and far past most home upload speeds, so frames queue and
+	// latency balloons. Default such runs to lighter settings for any knob the
+	// user didn't set explicitly. (--quality stays the adaptive ceiling.)
+	if *tunnel || *relayAddr != "" {
+		set := map[string]bool{}
+		fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+		if !set["width"] {
+			*width = 1280
+		}
+		if !set["fps"] {
+			*fpsFlag = 20
+		}
+		if !set["quality"] {
+			*quality = 55
+		}
+		log.Printf("internet mode: width=%d fps=%d quality<=%d (override with --width/--fps/--quality)", *width, *fpsFlag, *quality)
+	}
+
 	capturePath := resolveCapture(*script)
 	if _, err := os.Stat(capturePath); err != nil {
 		log.Fatalf("capture.py not found at %q (use --capture to point at it)", capturePath)
