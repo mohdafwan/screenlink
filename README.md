@@ -1,7 +1,17 @@
 # screenlink
 
+[![npm](https://img.shields.io/npm/v/screenlink.svg)](https://www.npmjs.com/package/screenlink)
+
 A from-scratch **remote desktop** (AnyDesk-style screen view + control) for
 Linux/Wayland. Companion to `termlink` (the terminal-only remote shell).
+
+Install in one command on any OS — npm ships a prebuilt binary:
+
+```sh
+npm install -g screenlink
+```
+
+> 📦 npm: <https://www.npmjs.com/package/screenlink>
 
 On Wayland the only way to capture the real desktop is the
 `xdg-desktop-portal` ScreenCast API, which yields a **PipeWire** video stream.
@@ -46,14 +56,20 @@ wheel, and keyboard drive the remote desktop. Press **Esc** to release control
 
 ## Install & run
 
-One command, same on every platform — installs the `screenlink` CLI onto your
-`PATH` (needs [Go](https://go.dev/dl) ≥ 1.22):
+The easiest way — installs the `screenlink` CLI onto your `PATH` with a prebuilt
+binary, no Go toolchain needed (works on Linux, macOS, Windows):
+
+```sh
+npm install -g screenlink         # https://www.npmjs.com/package/screenlink
+```
+
+Or build from source with Go ≥ 1.22:
 
 ```sh
 go install github.com/mohdafwan/screenlink@latest
 ```
 
-Then the three subcommands work the same everywhere:
+Either way, the three subcommands work the same everywhere:
 
 ```sh
 screenlink host                       # share THIS screen (Linux/Wayland only)

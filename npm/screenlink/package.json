@@ -1,0 +1,31 @@
+{
+  "name": "screenlink",
+  "version": "0.1.0",
+  "description": "AnyDesk-style remote desktop (screen view + control) for Linux/Wayland. View & control from any OS; host on Linux.",
+  "keywords": [
+    "remote-desktop",
+    "screen-share",
+    "wayland",
+    "vnc",
+    "anydesk",
+    "remote-control"
+  ],
+  "homepage": "https://github.com/mohdafwan/screenlink#readme",
+  "bugs": "https://github.com/mohdafwan/screenlink/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mohdafwan/screenlink.git"
+  },
+  "license": "MIT",
+  "author": "mohdafwan",
+  "bin": {
+    "screenlink": "bin/screenlink.js"
+  },
+  "files": [
+    "bin/screenlink.js",
+    "vendor/"
+  ],
+  "engines": {
+    "node": ">=14"
+  }
+}

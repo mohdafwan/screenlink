@@ -1,2 +1,5 @@
 /bin/
 __pycache__/
+
+# npm: prebuilt binaries are build artifacts produced by npm/build.sh, not source
+/npm/screenlink/vendor/
