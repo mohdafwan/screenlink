@@ -30,9 +30,11 @@ type Controller struct {
 }
 
 // NewController builds a 5-rung ladder from the worst tier (qMin, low fps) up to
-// the configured ceilings (qCeil, fpsCeil), and starts optimistically at the
-// top so a healthy link runs full quality until proven otherwise.
-func NewController(qCeil, qMin, fpsCeil int) *Controller {
+// the configured ceilings (qCeil, fpsCeil). With optimisticStart it begins at the
+// top rung (good for a LAN: run full quality until proven otherwise); otherwise
+// it begins mid-ladder, which suits the internet — ramp up only with proven
+// headroom instead of flooding the link on connect.
+func NewController(qCeil, qMin, fpsCeil int, optimisticStart bool) *Controller {
 	if qMin < 1 {
 		qMin = 1
 	}
@@ -52,7 +54,11 @@ func NewController(qCeil, qMin, fpsCeil int) *Controller {
 		}
 		levels[i] = Level{Quality: q, FPS: fps}
 	}
-	return &Controller{levels: levels, cur: len(levels) - 1}
+	cur := len(levels) - 1
+	if !optimisticStart {
+		cur = len(levels) / 2 // mid-ladder
+	}
+	return &Controller{levels: levels, cur: cur}
 }
 
 // Tune folds in one interval's delivered/dropped counts and returns the level to

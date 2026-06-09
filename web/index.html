@@ -6,14 +6,15 @@
 <title>screenlink</title>
 <style>
   html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
-  #screen {
+  .screen {
     display: block;
+    position: fixed; inset: 0;
     width: 100vw; height: 100vh;
-    object-fit: contain;     /* show whole desktop, letterboxed */
+    object-fit: contain;     /* show whole desktop, letterboxed (works on <img> and <canvas>) */
     background: #000;
     cursor: crosshair;
   }
-  body.viewonly #screen { cursor: default; }
+  body.viewonly .screen { cursor: default; }
   #status {
     position: fixed; top: 8px; left: 8px;
     font: 12px/1.4 system-ui, sans-serif; color: #9f9;
@@ -26,61 +27,161 @@
     background: rgba(0,0,0,.55); padding: 4px 10px; border-radius: 4px;
     pointer-events: none; user-select: none;
   }
+  #err {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    max-width: 80vw; text-align: center;
+    font: 14px/1.5 system-ui, sans-serif; color: #fbb;
+    background: rgba(40,0,0,.8); padding: 12px 16px; border-radius: 6px;
+    pointer-events: none; user-select: none; display: none;
+  }
 </style>
 </head>
 <body>
-  <!-- Frames arrive as binary WebSocket messages and are painted into this <img>
-       via blob URLs. A WebSocket (unlike MJPEG) is a raw passthrough that CDNs/
-       tunnels don't buffer, so the view stays real-time over a cloudflared URL;
-       and on an https page it's wss://, so control isn't blocked as mixed
-       content. Input events go back over the same socket. -->
-  <img id="screen" alt="remote screen" draggable="false">
+  <!-- Two render paths, picked by the host-injected codec:
+       - mjpeg: each binary WS message is a full JPEG, painted into <img> via a
+         blob URL. Works in any browser.
+       - h264 : each binary WS message is [1-byte flag][Annex-B access unit];
+         flag 1 = keyframe. Decoded with WebCodecs VideoDecoder and drawn to
+         <canvas>. Inter-frame coded, so far fewer bytes — but Chrome/Edge only.
+       Either way the WebSocket is a raw passthrough that tunnels/CDNs don't
+       buffer, so the view stays real-time; input events go back over it too. -->
+  <img id="screen-img" class="screen" alt="remote screen" draggable="false">
+  <canvas id="screen-canvas" class="screen"></canvas>
   <div id="status">screenlink — connecting…</div>
   <div id="hint"></div>
+  <div id="err"></div>
 
 <script>
 "use strict";
-// Replaced server-side with true/false depending on whether the host could open
-// /dev/uinput (see indexHandler in main.go). Controls whether input is forwarded;
-// the live view works either way.
+// Replaced server-side: whether the host could open /dev/uinput (controls input
+// forwarding), and which codec the host is sending.
 const CONTROL = __CONTROL__;
+const CODEC = "__CODEC__";          // "mjpeg" | "h264"
+const useH264 = CODEC === "h264";
 
-const img = document.getElementById("screen");
+const img = document.getElementById("screen-img");
+const canvas = document.getElementById("screen-canvas");
 const statusEl = document.getElementById("status");
 const hintEl = document.getElementById("hint");
+const errEl = document.getElementById("err");
+
+// The active display element (and hide the other one).
+const view = useH264 ? canvas : img;
+(useH264 ? img : canvas).style.display = "none";
 if (!CONTROL) document.body.classList.add("viewonly");
+
+function showError(msg) { errEl.textContent = msg; errEl.style.display = "block"; }
 
 let ws, wsReady = false;
 let controlling = false;     // are we actively forwarding input?
-let curURL = null;           // current blob URL backing the <img>
 
+// ---- mjpeg rendering: blob URL into <img> -----------------------------------
+let curURL = null;
+function onMjpegFrame(data) {
+  const url = URL.createObjectURL(data);
+  img.src = url;
+  if (curURL) URL.revokeObjectURL(curURL);
+  curURL = url;
+}
+
+// ---- h264 rendering: WebCodecs VideoDecoder into <canvas> --------------------
+// The decoder must start on a keyframe, so we ignore frames until the first one
+// (and after any error). The host emits a keyframe ~every second, so a fresh
+// viewer — or one recovering from a dropped frame — re-syncs within ~1s instead
+// of showing corruption.
+const ctx = useH264 ? canvas.getContext("2d") : null;
+let decoder = null, awaitingKey = true, ts = 0;
+
+function setupDecoder() {
+  awaitingKey = true;
+  if (decoder && decoder.state !== "closed") { try { decoder.close(); } catch (e) {} }
+  decoder = new VideoDecoder({
+    output: (frame) => {
+      if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+        canvas.width = frame.displayWidth;
+        canvas.height = frame.displayHeight;
+      }
+      ctx.drawImage(frame, 0, 0);
+      frame.close();
+    },
+    error: (e) => {
+      // A decode error usually means a missing reference frame (a dropped delta).
+      // Rebuild the decoder and wait for the next keyframe to resync cleanly.
+      console.warn("decoder error, resyncing:", e.message);
+      setupDecoder();
+    },
+  });
+  // Annex-B (no `description`) — the stream carries SPS/PPS in-band before each
+  // keyframe. The codec string is a capability hint; constrained-baseline @ 5.1
+  // comfortably covers 1080p, and Chrome decodes the real params from the SPS.
+  decoder.configure({ codec: "avc1.42E033", optimizeForLatency: true });
+}
+
+function onH264Frame(buf) {
+  const bytes = new Uint8Array(buf);
+  const isKey = bytes[0] === 1;
+  if (awaitingKey) {
+    if (!isKey) return;        // can't start mid-GOP
+    awaitingKey = false;
+  }
+  if (!decoder || decoder.state !== "configured") return;
+  try {
+    decoder.decode(new EncodedVideoChunk({
+      type: isKey ? "key" : "delta",
+      timestamp: ts,           // microseconds; only needs to be monotonic here
+      data: bytes.subarray(1), // strip the flag byte -> raw access unit
+    }));
+    ts += 33333;
+  } catch (e) {
+    console.warn("decode failed, resyncing:", e.message);
+    awaitingKey = true;
+  }
+}
+
+// ---- transport --------------------------------------------------------------
 function connect() {
   const proto = location.protocol === "https:" ? "wss://" : "ws://";
   ws = new WebSocket(`${proto}${location.host}/ws`);
-  ws.binaryType = "blob";
+  ws.binaryType = useH264 ? "arraybuffer" : "blob";
   ws.onopen = () => { wsReady = true; render(); };
   ws.onmessage = (e) => {
-    if (typeof e.data === "string") return;       // server only sends binary frames
-    const url = URL.createObjectURL(e.data);
-    img.src = url;
-    if (curURL) URL.revokeObjectURL(curURL);      // free the previous frame
-    curURL = url;
+    if (typeof e.data === "string") return;   // server only sends binary frames
+    if (useH264) onH264Frame(e.data);
+    else onMjpegFrame(e.data);
   };
-  ws.onclose = () => { wsReady = false; controlling = false; render(); setTimeout(connect, 1000); };
+  ws.onclose = () => {
+    wsReady = false; controlling = false;
+    awaitingKey = true;     // resync to a keyframe on the next connection
+    render();
+    setTimeout(connect, 1000);
+  };
   ws.onerror = () => ws.close();
 }
-connect();
+
+if (useH264 && !("VideoDecoder" in window)) {
+  showError("This browser can't decode H.264 (needs WebCodecs — use Chrome or Edge). " +
+            "Or restart the host with  --codec mjpeg  to view here.");
+} else {
+  if (useH264) setupDecoder();
+  connect();
+}
 
 function send(obj) {
   if (wsReady && controlling) ws.send(JSON.stringify(obj));
 }
 
+// ---- input (shared by both render paths) ------------------------------------
 // Map a pointer event to a fraction (0..1) of the actual desktop, accounting for
-// object-fit: contain letterboxing (black bars around the image).
+// object-fit: contain letterboxing. Intrinsic size is the <img> natural size or
+// the <canvas> backing-store size (both equal the remote frame's pixels).
+function intrinsic() {
+  return useH264
+    ? { w: canvas.width || 1, h: canvas.height || 1 }
+    : { w: img.naturalWidth || 1, h: img.naturalHeight || 1 };
+}
 function toFraction(e) {
-  const r = img.getBoundingClientRect();
-  const natW = img.naturalWidth || r.width;
-  const natH = img.naturalHeight || r.height;
+  const r = view.getBoundingClientRect();
+  const { w: natW, h: natH } = intrinsic();
   const scale = Math.min(r.width / natW, r.height / natH);
   const dispW = natW * scale, dispH = natH * scale;
   const offX = r.left + (r.width - dispW) / 2;
@@ -94,9 +195,9 @@ function engage() { if (CONTROL && wsReady) { controlling = true; render(); } }
 function release() { controlling = false; render(); }
 
 if (CONTROL) {
-  // Click the image to take control; Esc (or blur) gives it back so local
+  // Click the screen to take control; Esc (or blur) gives it back so local
   // browser shortcuts work again.
-  img.addEventListener("mousedown", (e) => {
+  view.addEventListener("mousedown", (e) => {
     if (!controlling) engage();
     e.preventDefault();
     const f = toFraction(e);
@@ -111,18 +212,18 @@ if (CONTROL) {
 
   // Coalesce mouse moves to one per animation frame to avoid flooding the socket.
   let pending = null;
-  img.addEventListener("mousemove", (e) => { if (controlling) pending = toFraction(e); });
+  view.addEventListener("mousemove", (e) => { if (controlling) pending = toFraction(e); });
   (function pump() {
     if (pending) { send({ t: "m", x: pending.x, y: pending.y }); pending = null; }
     requestAnimationFrame(pump);
   })();
 
   // Right-click should reach the remote, not open the local context menu.
-  img.addEventListener("contextmenu", (e) => { if (controlling) e.preventDefault(); });
+  view.addEventListener("contextmenu", (e) => { if (controlling) e.preventDefault(); });
 
   // Scroll wheel -> wheel notches. Browser deltaY is +down; host wheel is +up,
   // so negate. One notch per event keeps speed predictable.
-  img.addEventListener("wheel", (e) => {
+  view.addEventListener("wheel", (e) => {
     if (!controlling) return;
     e.preventDefault();
     const dy = e.deltaY > 0 ? -1 : e.deltaY < 0 ? 1 : 0;

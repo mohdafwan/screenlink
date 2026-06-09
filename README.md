@@ -6,26 +6,21 @@ Linux/Wayland. Companion to `termlink` (the terminal-only remote shell).
 On Wayland the only way to capture the real desktop is the
 `xdg-desktop-portal` ScreenCast API, which yields a **PipeWire** video stream.
 `capture.py` drives that (and the one-time "Share your screen?" permission),
-GStreamer encodes each frame to JPEG, and the Go host streams them to a browser.
-The browser also captures the viewer's mouse/keyboard and ships them back over a
-WebSocket, where the host replays them through the kernel's **uinput** device.
+GStreamer encodes it (**H.264** by default, MJPEG optional), and the Go host
+streams the frames to a browser over a WebSocket. The browser also captures the
+viewer's mouse/keyboard and ships them back over the same socket, where the host
+replays them through the kernel's **uinput** device.
 
-## Status
-
-- [x] **Phase 1 — live screen in the browser (view only)** ✅
-- [x] **Phase 2 — mouse/keyboard control (browser → host via uinput)** ✅
-- [x] **Phase 3 — connect over the internet via a relay (AnyDesk-style ID)** ✅
-- [x] **Phase 4 — adaptive bitrate (auto quality + fps to fit the link)** ✅
-
-## Requirements (already present on this machine)
+## Requirements
 
 - A Wayland session with `xdg-desktop-portal-gnome` + `pipewire`
-- `gstreamer` with `pipewiresrc` + `jpegenc`
+- `gstreamer` with `pipewiresrc`, `x264enc` + `h264parse` (H.264) and `jpegenc` (MJPEG)
 - `python3` with `gi` (PyGObject) and `dbus`
 - Go (local install at `~/.go-sdk`)
-- For **control** (Phase 2): write access to `/dev/uinput` — see below.
+- A viewer browser: any browser for MJPEG; **Chrome/Edge** for H.264 (needs WebCodecs)
+- For **control**: write access to `/dev/uinput` — see below.
 
-## Enabling remote control (Phase 2)
+## Enabling remote control
 
 Injecting input needs write access to `/dev/uinput`. It's `root:input` (mode
 660) by default, so the one-time fix is to join the `input` group:
@@ -74,36 +69,58 @@ git clone https://github.com/mohdafwan/screenlink && cd screenlink
 make run                   # build + serve on :8087  (or: go run . host)
 ```
 
-Then open **http://localhost:8087** in a browser. The first run pops a
-"Share your screen?" dialog — approve it once (the permission is remembered).
-The `connect` and `relay` subcommands don't need `capture.py`, so `go install`
-alone is enough for those.
+Then open **http://localhost:8087** from **another device** (viewing on the host
+machine itself is blocked — see below). The first run pops a "Share your screen?"
+dialog — approve it once (the permission is remembered). The `connect` and
+`relay` subcommands don't need `capture.py`, so `go install` alone is enough for
+those.
 
 Flags:
 
 | flag | meaning | default |
 |---|---|---|
 | `--addr` | address to serve the viewer on | `:8087` |
-| `--fps` | max capture frames per second (adaptive ceiling) | `40` |
-| `--quality` | max JPEG quality 1–100 (adaptive ceiling) | `70` |
+| `--codec` | `h264` (sharp, low-bitrate, Chrome/Edge) or `mjpeg` (any browser) | `h264` |
+| `--bitrate` | H.264 target bitrate in kbps (CBR); higher = sharper | `6000` |
+| `--fps` | max capture frames per second | `40` |
 | `--width` | downscale to this width (0 = native) | `0` |
-| `--min-quality` | lowest quality adaptive will drop to | `20` |
-| `--no-adaptive` | hold `--quality`/`--fps` fixed (no auto-tuning) | off |
+| `--quality` | max JPEG quality 1–100 (MJPEG only, adaptive ceiling) | `70` |
+| `--min-quality` | lowest quality adaptive will drop to (MJPEG only) | `20` |
+| `--no-adaptive` | hold quality/fps fixed (MJPEG only) | off |
 | `--password` | require this password (HTTP Basic Auth) — use when tunneling | — |
+| `--allow-local` | allow viewing on the host machine itself | off |
+| `--tunnel` | expose a public https URL via `cloudflared` | off |
 
-### Adaptive bitrate (Phase 4)
+## Video codecs
 
-By default the host **auto-tunes** to what the viewer can actually receive. Once
-a second it checks how many frames viewers are dropping and steps a 5-rung
-quality+fps ladder: it backs off fast when the link is congested and climbs back
-toward `--quality`/`--fps` when there's headroom. `--quality` and `--fps` are the
-*ceilings*; `--min-quality` is the floor.
+**H.264 (default).** Inter-frame compression: only what *changed* between frames
+is sent, so a mostly-static desktop streams at a fraction of MJPEG's bytes. That
+lets the host keep **native resolution** even on a thin link and cap the load
+with a fixed CBR `--bitrate`. The host emits a keyframe ~once a second; the
+browser decodes with **WebCodecs** into a `<canvas>` and re-syncs to the next
+keyframe after any dropped frame, so glitches self-heal in ≈1s. Chrome/Edge only.
 
-Both levers are low-latency — no transcoding, no buffering. Quality is changed
-live on the GStreamer encoder; fps is capped host-side. At the floor a frame is
-~2.3× smaller and sent ~5× less often than at full quality (≈10× less
-bandwidth). Resolution stays fixed (`--width`) since changing it live would
-flicker. Use `--no-adaptive` to pin a constant quality/fps.
+**MJPEG (`--codec mjpeg`).** Every frame is a standalone JPEG painted into an
+`<img>` — works in any browser, but uses far more bandwidth at the same quality.
+Use it for non-Chromium viewers, or when WebCodecs isn't available.
+
+For MJPEG the host **auto-tunes** to what the viewer can receive: once a second
+it checks the viewers' drop rate and steps a 5-rung quality+fps ladder — backing
+off fast on congestion, climbing back toward `--quality`/`--fps` with headroom
+(`--min-quality` is the floor). It's all low-latency: quality is changed live on
+the encoder and fps is capped host-side; resolution stays at `--width`. H.264
+holds its fixed CBR cap instead and leans on keyframe re-sync.
+
+Over the internet (`--tunnel`/`--relay`) the defaults drop automatically: H.264
+to 3000 kbps @ 25 fps (native res), MJPEG to 960-wide @ 20 fps. Override any knob.
+
+## Viewing on the host is blocked
+
+By default the host refuses connections from **its own browser** — viewing the
+captured desktop on the very machine being captured just feeds the stream back
+into itself (a hall-of-mirrors). Such requests get a short "open this on another
+device" page. Tunnel and relay viewers are unaffected. Pass `--allow-local` to
+opt back in (e.g. when developing screenlink itself).
 
 ## Quickest internet access — one command
 
@@ -129,10 +146,14 @@ install on their side. (`cloudflared` must be installed on the host —
 <https://github.com/cloudflare/cloudflared/releases>. `--password PW` pins your
 own password instead of a generated one.)
 
+> Some ISPs block DNS for `*.trycloudflare.com`. If the URL shows
+> "DNS address could not be found" but `1.1.1.1`/`8.8.8.8` resolve it, point your
+> machine at one of those resolvers — or use the relay below.
+
 The built-in relay below is the alternative when you want your *own* fixed
 address/passcode infrastructure (AnyDesk-style) instead of a cloudflare URL.
 
-## Connecting over the internet (Phase 3)
+## Connecting over the internet
 
 Two machines behind home routers can't reach each other directly (NAT). A
 **relay** with a public IP solves it AnyDesk-style: both sides dial *out* to the
@@ -200,32 +221,29 @@ screenlink connect --relay RELAY_HOST:9000 --pin 408915 707490730
 
 You can also run the relay anywhere the same way: `screenlink relay --addr :9000`.
 
-> `screenlink host` is present off Linux but can't capture there — hosting from
-> Windows would need a separate backend (DXGI Desktop Duplication for capture +
-> the Win32 `SendInput` API for control), i.e. a future "Windows host".
-
 ## How it fits together
 
 ```
- PipeWire portal ──► capture.py ──(len+JPEG frames on stdout)──► Go host ──► browser
-   (Wayland)          gst encode                                 MJPEG /stream   <img>
+ PipeWire portal ──► capture.py ──(length-prefixed H.264/JPEG frames)──► Go host ──► browser
+   (Wayland)          gst encode                                  WebSocket /ws   <canvas>/<img>
 
- browser  ──(mouse/keyboard JSON over WebSocket /input)──►  Go host  ──►  /dev/uinput
-   events                                                   wsock         virtual device
+ browser ──(mouse/keyboard JSON over the same WebSocket)──► Go host ──► /dev/uinput
+   events                                                    wsock        virtual device
 
- over the internet (Phase 3):
-   viewer browser ─► screenlink connect (local proxy) ─► relay ─► screenlink host ─► (above)
+ over the internet:
+   viewer browser ─► cloudflared tunnel  ──────────────────┐
+   viewer browser ─► screenlink connect ─► relay ─► screenlink host ─► (above)
 ```
 
 ## Layout
 
 ```
-main.go                      CLI: host / connect / relay subcommands
-capture.py                   portal + PipeWire + GStreamer -> JPEG frame stream
-web/index.html               the viewer (<img src="/stream"> + input capture)
-internal/capture/capture.go  spawns capture.py, parses frames, retunes quality live
+main.go                      CLI: host / connect / relay subcommands; codec + access gating
+capture.py                   portal + PipeWire + GStreamer -> H.264/JPEG frame stream
+web/index.html               the viewer: WebCodecs/<canvas> (h264) or <img> (mjpeg) + input capture
+internal/capture/capture.go  spawns capture.py, reads its frame stream, retunes the encoder live
 internal/hub/hub.go          fans the latest frame out to all viewers + drop stats
-internal/adaptive/adaptive.go bandwidth ladder + fps gate (auto quality/fps)
+internal/adaptive/adaptive.go bandwidth ladder + fps gate (MJPEG auto quality/fps)
 internal/input/uinput.go     virtual mouse+keyboard via /dev/uinput (no daemon)
 internal/input/keymap.go     browser KeyboardEvent.code -> Linux keycodes
 internal/wsock/wsock.go      minimal dependency-free WebSocket server

@@ -23,7 +23,9 @@ type Options struct {
 	Script  string // path to capture.py
 	FPS     int
 	Quality int
-	Width   int // 0 = native resolution
+	Width   int    // 0 = native resolution
+	Codec   string // "mjpeg" or "h264"
+	Bitrate int    // h264 target bitrate in kbps (CBR)
 }
 
 // Capturer is a running capture.py process.
@@ -40,10 +42,16 @@ type Capturer struct {
 func Start(opts Options, onFrame func([]byte), onDone func(error)) (*Capturer, error) {
 	cmd := exec.Command("python3", opts.Script)
 	cmd.Stderr = os.Stderr // let the helper's [capture] logs through
+	codec := opts.Codec
+	if codec == "" {
+		codec = "mjpeg"
+	}
 	cmd.Env = append(os.Environ(),
 		"SCREENLINK_FPS="+strconv.Itoa(opts.FPS),
 		"SCREENLINK_QUALITY="+strconv.Itoa(opts.Quality),
 		"SCREENLINK_WIDTH="+strconv.Itoa(opts.Width),
+		"SCREENLINK_CODEC="+codec,
+		"SCREENLINK_BITRATE="+strconv.Itoa(opts.Bitrate),
 	)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

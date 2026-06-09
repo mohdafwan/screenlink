@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -81,25 +82,47 @@ func runHost(args []string) {
 	noAdaptive := fs.Bool("no-adaptive", false, "disable adaptive bitrate; hold --quality/--fps fixed")
 	password := fs.String("password", "", "require this password (HTTP Basic Auth) — strongly recommended when exposing via a tunnel")
 	tunnel := fs.Bool("tunnel", false, "expose the host on a public https URL automatically via cloudflared (one command, no relay)")
+	codec := fs.String("codec", "h264", "video codec: h264 (inter-frame, sharp + low bitrate, Chrome/Edge viewer) or mjpeg (every-frame JPEG, any browser)")
+	bitrate := fs.Int("bitrate", 6000, "h264 target bitrate in kbps (CBR); higher = sharper. Ignored for mjpeg")
+	allowLocal := fs.Bool("allow-local", false, "allow opening the viewer on the host machine itself (default: blocked — viewing the captured screen on its own device just feeds the capture back into itself)")
 	fs.Parse(args)
 
-	// Internet links (a tunnel or a relay) can't carry native 1080p@40fps —
-	// that's ~15 MB/s and far past most home upload speeds, so frames queue and
-	// latency balloons. Default such runs to lighter settings for any knob the
-	// user didn't set explicitly. (--quality stays the adaptive ceiling.)
-	if *tunnel || *relayAddr != "" {
+	h264 := *codec == "h264"
+
+	// Internet links (a tunnel or a relay) can't carry the full-fat LAN stream,
+	// so default such runs to lighter settings for any knob the user didn't set.
+	//
+	// h264: bitrate is a hard CBR cap independent of resolution, so we keep
+	// native res and just lower the cap (3 Mbps) — a thin link still gets a sharp
+	// 1080p picture, just with more compression on busy frames.
+	//
+	// mjpeg: resolution is the dominant — and non-adaptive — bitrate lever, so
+	// 960-wide (~540p, ~92 KB/frame vs ~175 KB at 1280) is the floor the link
+	// must always sustain.
+	internet := *tunnel || *relayAddr != ""
+	if internet {
 		set := map[string]bool{}
 		fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
-		if !set["width"] {
-			*width = 1280
+		if h264 {
+			if !set["bitrate"] {
+				*bitrate = 3000
+			}
+			if !set["fps"] {
+				*fpsFlag = 25
+			}
+			log.Printf("internet mode (h264): bitrate=%dkbps fps=%d native res (override with --bitrate/--fps/--width)", *bitrate, *fpsFlag)
+		} else {
+			if !set["width"] {
+				*width = 960
+			}
+			if !set["fps"] {
+				*fpsFlag = 20
+			}
+			if !set["quality"] {
+				*quality = 55
+			}
+			log.Printf("internet mode (mjpeg): width=%d fps=%d quality<=%d (override with --width/--fps/--quality)", *width, *fpsFlag, *quality)
 		}
-		if !set["fps"] {
-			*fpsFlag = 20
-		}
-		if !set["quality"] {
-			*quality = 55
-		}
-		log.Printf("internet mode: width=%d fps=%d quality<=%d (override with --width/--fps/--quality)", *width, *fpsFlag, *quality)
 	}
 
 	capturePath := resolveCapture(*script)
@@ -110,11 +133,17 @@ func runHost(args []string) {
 	h := hub.New()
 
 	// fps gate sits between capture and the hub so the adaptive controller can
-	// throttle forwarded frames without touching the GStreamer pipeline.
+	// throttle forwarded frames without touching the GStreamer pipeline. h264 is
+	// inter-frame coded, so dropping an encoded frame here would corrupt every
+	// later frame until the next keyframe — disable the gate and let the encoder
+	// own the frame rate (the live source drops *raw* frames under load instead).
 	gate := adaptive.NewGate(*fpsFlag)
+	if h264 {
+		gate.SetTarget(0) // 0 = forward every frame, no host-side dropping
+	}
 
 	cap, err := capture.Start(
-		capture.Options{Script: capturePath, FPS: *fpsFlag, Quality: *quality, Width: *width},
+		capture.Options{Script: capturePath, FPS: *fpsFlag, Quality: *quality, Width: *width, Codec: *codec, Bitrate: *bitrate},
 		func(frame []byte) {
 			if gate.Allow() {
 				h.Publish(frame)
@@ -132,9 +161,14 @@ func runHost(args []string) {
 	}
 
 	// Adaptive bitrate (Phase 4): once per second, nudge quality/fps toward what
-	// viewers can keep up with.
-	if !*noAdaptive {
-		ctrl := adaptive.NewController(*quality, *minQuality, *fpsFlag)
+	// viewers can keep up with. This ladder is MJPEG-specific (it drops fps and
+	// steps JPEG quality); h264 holds a fixed CBR cap instead, with the viewer
+	// re-syncing to keyframes when the link can't keep up.
+	if !*noAdaptive && !h264 {
+		// Start optimistically (top rung) on a LAN, but mid-ladder over the
+		// internet so the session doesn't open with a full-bitrate flood that
+		// fills the tunnel buffer before the controller can back off.
+		ctrl := adaptive.NewController(*quality, *minQuality, *fpsFlag, !internet)
 		go adaptiveLoop(ctrl, h, cap, gate)
 		log.Printf("adaptive bitrate on (quality %d..%d, fps up to %d)", *minQuality, *quality, *fpsFlag)
 	}
@@ -157,7 +191,7 @@ func runHost(args []string) {
 	mux.HandleFunc("/ws", wsHandler(h, injector)) // frames out + input in, one socket
 	mux.HandleFunc("/stream", streamHandler(h))    // legacy MJPEG (LAN/no-JS fallback)
 	mux.HandleFunc("/input", inputHandler(injector))
-	mux.HandleFunc("/", indexHandler(injector != nil))
+	mux.HandleFunc("/", indexHandler(injector != nil, *codec))
 
 	// Effective password. When tunneling we auto-generate one if none was given,
 	// so a public URL is never left wide open by accident.
@@ -175,6 +209,14 @@ func runHost(args []string) {
 		log.Printf("password protection on (HTTP Basic Auth)")
 	} else if *relayAddr == "" {
 		log.Printf("WARNING: no --password set; anyone who reaches this address can view+control.")
+	}
+
+	// Refuse to serve the host's own browser: viewing the captured desktop on the
+	// machine that's being captured loops the capture back into itself. Tunnel and
+	// relay viewers are unaffected (see blockLocal). --allow-local opts back in.
+	if !*allowLocal {
+		handler = blockLocal(handler)
+		log.Printf("local viewing blocked (use --allow-local to view on this machine)")
 	}
 
 	// Serve locally (direct/LAN access) in the background; the main goroutine then
@@ -265,6 +307,56 @@ func randomToken() string {
 // Basic Auth (any username). Browsers prompt once and then attach the
 // credentials to every request — including the /input WebSocket upgrade — so it
 // works transparently behind a tunnel.
+// blockLocal rejects requests that come straight from the host machine's own
+// browser. Viewing the stream on the very machine being captured just feeds the
+// capture back into itself — a hall-of-mirrors — so we answer with an
+// explanatory page instead. Real remote viewers are unaffected: a cloudflared
+// tunnel adds X-Forwarded-For / Cf-Connecting-Ip headers, and relay viewers
+// arrive from the relay's (non-loopback) address. Override with --allow-local.
+func blockLocal(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isHostLocal(r) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, localBlockPage)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// isHostLocal reports whether a request originates from the host machine itself:
+// a loopback source address with no proxy/tunnel headers in front of it.
+func isHostLocal(r *http.Request) bool {
+	if r.Header.Get("X-Forwarded-For") != "" ||
+		r.Header.Get("X-Forwarded-Host") != "" ||
+		r.Header.Get("Cf-Connecting-Ip") != "" ||
+		r.Header.Get("Forwarded") != "" {
+		return false // forwarded by a tunnel/proxy => a genuine remote viewer
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+const localBlockPage = `<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>screenlink</title><style>
+html,body{margin:0;height:100%;background:#111;color:#ddd;
+font:15px/1.6 system-ui,sans-serif;display:flex;align-items:center;justify-content:center}
+.box{max-width:30rem;text-align:center;padding:1.5rem}
+h1{color:#9f9;font-size:1.1rem;margin:0 0 .6rem}
+code{background:#222;color:#9cf;padding:1px 6px;border-radius:4px}
+</style></head><body><div class="box">
+<h1>screenlink — open this on another device</h1>
+<p>You're viewing on the machine that's sharing its screen, so the stream would
+just capture this very window (a hall-of-mirrors) — not useful.</p>
+<p>Open the link from a <b>different</b> phone or computer instead.</p>
+<p style="color:#888;font-size:.85rem">Really want to view here? Restart the host with <code>--allow-local</code>.</p>
+</div></body></html>`
+
 func basicAuth(h http.Handler, password string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, pass, ok := r.BasicAuth()
@@ -304,7 +396,10 @@ func runRelay(args []string) {
 	log.Fatal(relay.RunRelay(*addr))
 }
 
-func indexHandler(controlEnabled bool) http.HandlerFunc {
+func indexHandler(controlEnabled bool, codec string) http.HandlerFunc {
+	if codec != "h264" {
+		codec = "mjpeg"
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -315,8 +410,10 @@ func indexHandler(controlEnabled bool) http.HandlerFunc {
 			http.Error(w, "viewer missing", http.StatusInternalServerError)
 			return
 		}
-		// Tell the viewer whether control is live (replaces a placeholder).
+		// Tell the viewer whether control is live and which codec to decode
+		// (both replace placeholders baked into web/index.html).
 		page := strings.Replace(string(data), "__CONTROL__", boolJS(controlEnabled), 1)
+		page = strings.Replace(page, "__CODEC__", codec, 1)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		io.WriteString(w, page)
 	}
