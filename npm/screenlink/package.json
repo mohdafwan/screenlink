@@ -1,6 +1,6 @@
 {
   "name": "screenlink",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AnyDesk-style remote desktop (screen view + control) for Linux/Wayland. View & control from any OS; host on Linux.",
   "keywords": [
     "remote-desktop",

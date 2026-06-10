@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -82,6 +83,7 @@ func runHost(args []string) {
 	noAdaptive := fs.Bool("no-adaptive", false, "disable adaptive bitrate; hold --quality/--fps fixed")
 	password := fs.String("password", "", "require this password (HTTP Basic Auth) — strongly recommended when exposing via a tunnel")
 	tunnel := fs.Bool("tunnel", false, "expose the host on a public https URL automatically via cloudflared (one command, no relay)")
+	noAutoInstall := fs.Bool("no-auto-install", false, "with --tunnel, don't auto-download cloudflared if it's missing (require it preinstalled)")
 	codec := fs.String("codec", "h264", "video codec: h264 (inter-frame, sharp + low bitrate, Chrome/Edge viewer) or mjpeg (every-frame JPEG, any browser)")
 	bitrate := fs.Int("bitrate", 6000, "h264 target bitrate in kbps (CBR); higher = sharper. Ignored for mjpeg")
 	allowLocal := fs.Bool("allow-local", false, "allow opening the viewer on the host machine itself (default: blocked — viewing the captured screen on its own device just feeds the capture back into itself)")
@@ -225,7 +227,7 @@ func runHost(args []string) {
 	go func() { log.Fatal(http.ListenAndServe(*addr, handler)) }()
 
 	if *tunnel {
-		go runTunnel(*addr, pw)
+		go runTunnel(*addr, pw, !*noAutoInstall)
 	}
 	if *relayAddr != "" {
 		log.Fatal(relay.ServeHTTP(*relayAddr, *pin, handler))
@@ -236,11 +238,22 @@ func runHost(args []string) {
 // runTunnel launches cloudflared to expose the local host on a public https URL,
 // then prints that URL (and the password) front-and-centre so the whole thing is
 // a single command: `screenlink host --tunnel`.
-func runTunnel(localAddr, password string) {
-	bin := findCloudflared()
+func runTunnel(localAddr, password string, autoInstall bool) {
+	var bin string
+	if autoInstall {
+		bin = ensureCloudflared() // find it, or download the official build into cache
+	} else {
+		bin = findCloudflared()
+	}
 	if bin == "" {
-		log.Printf("--tunnel: cloudflared not found. Install it from")
-		log.Printf("  https://github.com/cloudflare/cloudflared/releases  (then re-run)")
+		log.Printf("--tunnel: cloudflared unavailable — the host is still up on")
+		log.Printf("  localhost/LAN, but there's no public URL. Install cloudflared:")
+		log.Printf("  https://github.com/cloudflare/cloudflared/releases")
+		if password != "" {
+			// Otherwise the auto-generated password is never shown and even LAN
+			// access is impossible.
+			log.Printf("  (Basic Auth is on — password: %s)", password)
+		}
 		return
 	}
 	url := "http://localhost" + normalizeAddr(localAddr)
@@ -272,12 +285,102 @@ func findCloudflared() string {
 		filepath.Join(home, "go", "bin", "cloudflared"),
 		"/usr/local/bin/cloudflared",
 		"/usr/bin/cloudflared",
+		// our own cached copy from a previous auto-install
+		filepath.Join(cloudflaredCacheDir(), "cloudflared"),
 	} {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
 	}
 	return ""
+}
+
+// cloudflaredCacheDir is where we keep an auto-downloaded cloudflared.
+func cloudflaredCacheDir() string {
+	if dir, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(dir, "screenlink")
+	}
+	return filepath.Join(os.Getenv("HOME"), ".cache", "screenlink")
+}
+
+// ensureCloudflared returns a usable cloudflared path, downloading Cloudflare's
+// official binary into the cache if it isn't already installed. Hosting (so also
+// --tunnel) is Linux-only, which is the only platform Cloudflare ships as a bare
+// binary — no archive to unpack. Returns "" if it can't be made available.
+func ensureCloudflared() string {
+	if bin := findCloudflared(); bin != "" {
+		return bin
+	}
+	if runtime.GOOS != "linux" {
+		return "" // can't host off Linux anyway, so nothing to tunnel
+	}
+	var asset string
+	switch runtime.GOARCH {
+	case "amd64":
+		asset = "cloudflared-linux-amd64"
+	case "arm64":
+		asset = "cloudflared-linux-arm64"
+	case "386":
+		asset = "cloudflared-linux-386"
+	default:
+		log.Printf("--tunnel: no prebuilt cloudflared for linux/%s; install it manually", runtime.GOARCH)
+		return ""
+	}
+
+	dir := cloudflaredCacheDir()
+	dst := filepath.Join(dir, "cloudflared")
+	url := "https://github.com/cloudflare/cloudflared/releases/latest/download/" + asset
+	log.Printf("--tunnel: cloudflared not found — downloading Cloudflare's official build…")
+	log.Printf("  %s", url)
+	if err := downloadExecutable(url, dst, dir); err != nil {
+		log.Printf("--tunnel: auto-install failed: %v", err)
+		log.Printf("  install it manually: https://github.com/cloudflare/cloudflared/releases")
+		return ""
+	}
+	// Make sure the download is a working binary before we depend on it.
+	if err := exec.Command(dst, "--version").Run(); err != nil {
+		os.Remove(dst)
+		log.Printf("--tunnel: downloaded cloudflared didn't run (%v); removed it", err)
+		return ""
+	}
+	log.Printf("--tunnel: cloudflared installed at %s", dst)
+	return dst
+}
+
+// downloadExecutable fetches url to dst atomically and marks it executable.
+func downloadExecutable(url, dst, dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "screenlink")
+	client := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %s", resp.Status)
+	}
+	tmp := dst + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
 
 // printShareBox prints the public URL and password the viewer needs.

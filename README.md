@@ -105,7 +105,8 @@ Flags:
 | `--no-adaptive` | hold quality/fps fixed (MJPEG only) | off |
 | `--password` | require this password (HTTP Basic Auth) — use when tunneling | — |
 | `--allow-local` | allow viewing on the host machine itself | off |
-| `--tunnel` | expose a public https URL via `cloudflared` | off |
+| `--tunnel` | expose a public https URL via `cloudflared` (auto-downloaded if missing) | off |
+| `--no-auto-install` | with `--tunnel`, require a preinstalled cloudflared (no auto-download) | off |
 
 ## Video codecs
 
@@ -158,9 +159,12 @@ public URL + password:
 
 The other person opens that URL in **any browser on any network**, enters the
 password, and gets live view + control. No relay, no public server, nothing to
-install on their side. (`cloudflared` must be installed on the host —
-<https://github.com/cloudflare/cloudflared/releases>. `--password PW` pins your
-own password instead of a generated one.)
+install on their side.
+
+If `cloudflared` isn't installed, screenlink **auto-downloads** Cloudflare's
+official binary (cached in `~/.cache/screenlink/`) the first time you use
+`--tunnel` — so it really is one command. Pass `--no-auto-install` to require a
+preinstalled cloudflared instead, and `--password PW` to pin your own password.
 
 > Some ISPs block DNS for `*.trycloudflare.com`. If the URL shows
 > "DNS address could not be found" but `1.1.1.1`/`8.8.8.8` resolve it, point your
